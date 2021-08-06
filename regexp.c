@@ -21,7 +21,8 @@ enum {
 };
 
 typedef struct {
-  ExpType type;
+  unsigned short type    : 15;
+  unsigned short gc_mark : 1;
   uint_least16_t n_subexp;
   uint_least16_t subexp[];
 } Exp;
@@ -34,7 +35,6 @@ typedef struct {
   } buffer;
 
   struct {
-    uint_least16_t base_offset;
     size_t size;
     uint_least16_t root_id;
   } exp_tree;
@@ -92,6 +92,7 @@ static unsigned alloc_exp(ExpContext *ctx, ExpType type, unsigned n_subexp) {
   unsigned exp_id = offset_to_exp_id(offset);
   Exp *exp = get_exp(ctx, exp_id);
   exp->type = type;
+  exp->gc_mark = 0;
   exp->n_subexp = n_subexp;
   return exp_id;
 }
@@ -129,33 +130,251 @@ static unsigned copy_exp(ExpContext *ctx, unsigned exp_id) {
   return res_id;
 }
 
-// Garbage collect dead expressions and compact the reachable expressions
-// at the start of the buffer.
-static void garbage_collect(ExpContext *ctx) {
-  // Move the expression tree back to the start of the buffer
-  memmove(ctx->buffer.base, &ctx->buffer.base[ctx->exp_tree.base_offset],
-          ctx->exp_tree.size * sizeof(Exp));
+//===------------------------- Garbage Collection -------------------------===//
 
-  // Walk through all of the expressions in the tree and fixup any indices
-  unsigned adjust = ctx->exp_tree.base_offset;
-  for (size_t offset = 0; offset < ctx->exp_tree.size;) {
-    unsigned exp_id = offset_to_exp_id(offset);
-    Exp *exp = get_exp(ctx, exp_id);
+typedef struct {
+  uint_least16_t start_id;
+  uint_least16_t end_id;
+  uint_least16_t adjust;
+} ExpIDAdjustEntry;
 
-    for (unsigned j = 0; j < exp->n_subexp; j++) {
-      // Don't update any subexpressions which are interned
-      if (!is_interned(exp->subexp[j]))
-        exp->subexp[j] -= adjust;
+typedef struct {
+  size_t n_entries;
+  size_t n_alloc;
+  ExpIDAdjustEntry *data;
+} ExpIDAdjustMap;
+
+static void init_exp_id_adjust_map(ExpIDAdjustMap *map,
+                                   ExpIDAdjustEntry *data,
+                                   size_t n_entries) {
+  map->n_entries = 0;
+  map->n_alloc = n_entries;
+  map->data = data;
+}
+
+static void clear_exp_id_adjust_map(ExpIDAdjustMap *map) {
+  map->n_entries = 0;
+}
+
+static unsigned exp_id_adjust_map_find(ExpIDAdjustMap *map, unsigned exp_id) {
+  for (unsigned i = 0; i < map->n_entries; i++)
+    if (exp_id < map->data[i].start_id)
+      return i;
+  return map->n_entries;
+
+  if (map->n_entries == 0)
+    return 0;
+
+  unsigned low = 0;
+  unsigned high = map->n_entries - 1;
+
+  while (low <= high) {
+    unsigned mid = (low + high) / 2;
+    unsigned start_id = map->data[mid].start_id;
+    if (exp_id > start_id)
+      low = mid + 1;
+    else if (exp_id < start_id)
+      high = mid + 1;
+    else
+      return mid;
+  }
+  return high;
+}
+
+static void exp_id_adjust_map_insert(ExpIDAdjustMap *map, unsigned start_id,
+                                     unsigned end_id, unsigned adjust) {
+  unsigned insert_pos = exp_id_adjust_map_find(map, start_id);
+  fprintf (stderr, "insert: %d %d %d at: %d\n", start_id, end_id, adjust, insert_pos);
+  if (insert_pos < map->n_entries)
+    assert (map->data[insert_pos].start_id != start_id);
+
+  // Allocate space in the exp_id map, then shuffle everything after the
+  // insert position to make room
+  map->n_entries++;
+  assert (map->n_entries <= map->n_alloc);
+  memmove(map->data + insert_pos + 1, map->data + insert_pos,
+          (map->n_entries - insert_pos) * sizeof(*map->data));
+
+  ExpIDAdjustEntry *entry = &map->data[insert_pos];
+  entry->start_id = start_id;
+  entry->end_id = end_id;
+  entry->adjust = adjust;
+
+  for (int i = 0; i < map->n_entries; i++)
+    fprintf(stderr, "%d ", map->data[i].start_id);
+  fprintf(stderr, "\n");
+
+}
+
+static void gc_mark(ExpContext *ctx, unsigned exp_id, int mark) {
+  if (is_interned(exp_id))
+    return;
+
+  Exp *exp = get_exp(ctx, exp_id);
+  exp->gc_mark = mark;
+  for (unsigned i = 0; i < exp->n_subexp; i++)
+    gc_mark(ctx, exp->subexp[i], mark);
+}
+
+static unsigned gc_compute_exp_id_adjustments(ExpContext *ctx,
+                                              ExpIDAdjustMap *map,
+                                              unsigned *offset,
+                                              unsigned *adjust) {
+  int done = 1;
+
+  clear_exp_id_adjust_map(map);
+
+  // Add mappings until we run out of space or we're reached the end of the heap
+  while (map->n_entries < map->n_alloc
+         && *offset < ctx->buffer.next_offset) {
+
+    // Iterate until we find an expression with the gc mark set, this is
+    // the first id in the range to be adjusted
+    int gc_mark = 0;
+    unsigned next_offset = 0;
+    while (!gc_mark && *offset < ctx->buffer.next_offset) {
+      Exp *exp = get_exp(ctx, offset_to_exp_id(*offset));
+      next_offset = next_exp_offset(*offset, exp->n_subexp);
+      if (!exp->gc_mark) {
+        *adjust += next_offset - *offset;
+        *offset = next_offset;
+      } else
+        gc_mark = 1;
     }
-    offset = next_exp_offset(offset, exp->n_subexp);
+    if (!gc_mark)
+      continue;
+    assert (next_offset >= *offset);
+    unsigned start_id = offset_to_exp_id(*offset);
+
+    dump_exp(ctx, start_id, 2);
+
+    // Now keep iterating until the next expression doesn't have the gc mark
+    // set. This will be the end of the range.
+    *offset = next_offset;
+    unsigned end_id = offset_to_exp_id(*offset);
+
+    while (gc_mark && *offset < ctx->buffer.next_offset) {
+      unsigned exp_id = offset_to_exp_id(*offset);
+      Exp *exp = get_exp(ctx, exp_id);
+      *offset = next_exp_offset(*offset, exp->n_subexp);
+      end_id = offset_to_exp_id(*offset);
+      if (!exp->gc_mark)
+        gc_mark = 0;
+    }
+
+    // Add the entry to the map
+    done = 0;
+    exp_id_adjust_map_insert(map, start_id, end_id, *adjust);
   }
 
-  // Also fixup indices in the context
-  ctx->exp_tree.base_offset -= adjust;
-  if (!is_interned(ctx->exp_tree.root_id))
-    ctx->exp_tree.root_id -= adjust;
-  ctx->buffer.next_offset -= adjust;
+  return !done;
 }
+
+static unsigned gc_rewrite_exp_ids(ExpContext *ctx, ExpIDAdjustMap *map,
+                                   unsigned exp_id) {
+  if (is_interned(exp_id))
+    return exp_id;
+
+  fprintf (stderr, "Rewriting %d\n", exp_id);
+
+  // Recursively rewrite subexpressions
+  Exp *exp = get_exp(ctx, exp_id);
+  for (unsigned i = 0; i < exp->n_subexp; i++)
+    exp->subexp[i] = gc_rewrite_exp_ids(ctx, map, exp->subexp[i]);
+
+  // Get the entry in the adjustment map which covers this expression id.
+  unsigned index = exp_id_adjust_map_find(map, exp_id);
+  if (index > 0)
+    index--;
+  ExpIDAdjustEntry *entry = map->data + index;
+
+  if (entry->start_id > exp_id || entry->end_id <= exp_id)
+    return exp_id;
+  assert (exp_id >= entry->start_id);
+  assert (exp_id < entry->end_id);
+
+  fprintf (stderr, "Adjusting exp_id %d %d\n", exp_id, exp_id - entry->adjust);
+  return exp_id - entry->adjust;
+}
+
+static void gc_compact(ExpContext *ctx, ExpIDAdjustMap *map) {
+  for (unsigned i = 0; i < map->n_entries; i++) {
+    ExpIDAdjustEntry *entry = &map->data[i];
+    Exp *start = &ctx->buffer.base[exp_id_to_offset(entry->start_id)];
+    Exp *end   = &ctx->buffer.base[exp_id_to_offset(entry->end_id)];
+    Exp *dst   = start - entry->adjust;
+    memmove(dst, start, (end - start) * sizeof(Exp));
+  }
+}
+
+static unsigned gc_calculate_next_offset(ExpContext *ctx, unsigned exp_id) {
+                                         
+  if (is_interned(exp_id))
+    return 0;
+
+  Exp *exp = get_exp(ctx, exp_id);
+  unsigned max_offset = next_exp_offset(exp_id_to_offset(exp_id),
+                                        exp->n_subexp);
+
+  for (unsigned i = 0; i < exp->n_subexp; i++) {
+    unsigned tmp = gc_calculate_next_offset(ctx, exp->subexp[i]);
+    if (tmp > max_offset)
+      max_offset = tmp;
+  }
+  return max_offset;
+}
+
+static void dump_buffers(ExpContext *ctx) {
+  unsigned offset = 0;
+  while (offset < ctx->buffer.next_offset) {
+    Exp *exp = get_exp(ctx, offset_to_exp_id(offset));
+
+    fprintf (stderr, "%d -> ", offset_to_exp_id(offset));
+    fprintf (stderr, exp->gc_mark ? "O" : "X");
+    fprintf (stderr, " [0x%x:", exp->type);
+    for (unsigned i = 0; i < exp->n_subexp; i++)
+      fprintf (stderr, " %d", exp->subexp[i]);
+    fprintf (stderr, "]\n");
+
+    offset = next_exp_offset(offset, exp->n_subexp);
+  }
+  fprintf (stderr, "\n\n");
+}
+
+static void garbage_collect(ExpContext *ctx) {
+  // Mark expressions reachable from the root
+  gc_mark(ctx, ctx->exp_tree.root_id, /*mark=*/1);
+
+  dump_buffers(ctx);
+
+  // Iteratively compact the heap. This could be done in a single pass but
+  // then the size of the ExpID adjustment map could only be determined at
+  // runtime.
+  ExpIDAdjustEntry exp_id_adjust_entry[32];
+  ExpIDAdjustMap   exp_id_adjust_map;
+  init_exp_id_adjust_map(&exp_id_adjust_map, exp_id_adjust_entry, 32);
+
+  unsigned offset = 0;
+  unsigned adjust = 0;
+  while (gc_compute_exp_id_adjustments(ctx, &exp_id_adjust_map,
+                                       &offset, &adjust)) {
+    // Offset adjustments have been computed, walk through the expression
+    // tree from the root and rewrite expressions
+    ctx->exp_tree.root_id = gc_rewrite_exp_ids(ctx, &exp_id_adjust_map,
+                                               ctx->exp_tree.root_id);
+
+    // Finally we can compact the expression tree based on the offset
+    // adjustments
+    gc_compact(ctx, &exp_id_adjust_map);
+  }
+  ctx->buffer.next_offset = gc_calculate_next_offset(ctx,
+                                                     ctx->exp_tree.root_id);
+  dump_buffers(ctx);
+
+  // Clear the gc mark now we're done
+  gc_mark(ctx, ctx->exp_tree.root_id, /*mark=*/0);
+}
+
 
 static int compare(ExpContext *ctx, unsigned lhs_id, unsigned rhs_id) {
   // First try and sort by type
@@ -347,13 +566,8 @@ static unsigned derive_exp(ExpContext *ctx, unsigned exp_id, unsigned char c) {
 }
 
 static void derive(ExpContext *ctx, unsigned char c) {
-  unsigned new_base_offset = ctx->buffer.next_offset;
   unsigned new_root_id = derive_exp(ctx, ctx->exp_tree.root_id, c);
-  unsigned new_size = ctx->buffer.next_offset - new_base_offset;
-
-  ctx->exp_tree.base_offset = new_base_offset;
   ctx->exp_tree.root_id = new_root_id;
-  ctx->exp_tree.size = new_size;
 }
 
 static unsigned flatten_exp(ExpContext *ctx, ExpType type, unsigned exp_id,
@@ -390,13 +604,8 @@ static unsigned flatten_exp(ExpContext *ctx, ExpType type, unsigned exp_id,
 
 static void flatten(ExpContext *ctx) {
   uint_least16_t new_root_id;
-  unsigned new_base_offset = ctx->buffer.next_offset;
   flatten_exp(ctx, kEmptySet, ctx->exp_tree.root_id, &new_root_id);
-  unsigned new_size = ctx->buffer.next_offset - new_base_offset;
-
-  ctx->exp_tree.base_offset = new_base_offset;
   ctx->exp_tree.root_id = new_root_id;
-  ctx->exp_tree.size = new_size;
 }
 
 static unsigned simplify_exp(ExpContext *ctx, unsigned exp_id, int *modified) {
@@ -480,13 +689,8 @@ static unsigned simplify_exp(ExpContext *ctx, unsigned exp_id, int *modified) {
 static int simplify(ExpContext *ctx) {
   int modified = 0;
 
-  unsigned new_base_offset = ctx->buffer.next_offset;
   unsigned new_root_id = simplify_exp(ctx, ctx->exp_tree.root_id, &modified);
-  unsigned new_size = ctx->buffer.next_offset - new_base_offset;
-
-  ctx->exp_tree.base_offset = new_base_offset;
   ctx->exp_tree.root_id = new_root_id;
-  ctx->exp_tree.size = new_size;
 
   return modified;
 }
@@ -622,18 +826,40 @@ int main(void) {
         'c'));
   */
 
+
+/*
+  ExpIDAdjustMap map;
+  ExpIDAdjustEntry data[32];
+  init_exp_id_adjust_map(&map, &data[0], 32);
+
+  exp_id_adjust_map_insert(&map, 255, 0, 0);
+  exp_id_adjust_map_insert(&map, 254, 0, 0);
+  exp_id_adjust_map_insert(&map, 253, 0, 0);
+  exp_id_adjust_map_insert(&map, 252, 0, 0);
+  exp_id_adjust_map_insert(&map, 251, 0, 0);
+  exp_id_adjust_map_insert(&map, 250, 0, 0);
+  return 0;
+*/
+
+
+  alloc_exp(&ctx, kConcat, 10);
+
   ctx.exp_tree.root_id = alloc_exp(&ctx, kConcat, 5);
   Exp *root = get_exp(&ctx, ctx.exp_tree.root_id);
-  root->subexp[4] = 'a';
-  root->subexp[3] = 'c';
+  root->subexp[0] = 'a';
+  root->subexp[1] = 'b';
   root->subexp[2] = 'c';
-  root->subexp[1] = 'c';
-  root->subexp[0] = 'e';
+  root->subexp[3] = 'd';
+  root->subexp[4] = 'e';
+
+  alloc_exp(&ctx, kConcat, 10);
+
+  garbage_collect(&ctx);
 
   sort_exp(&ctx, ctx.exp_tree.root_id);
   dump_exp(&ctx, ctx.exp_tree.root_id, 0);
 
-  //match_regexp(&ctx, "abcde", 5);
+  match_regexp(&ctx, "abcde", 5);
 
   return 0;
 }
