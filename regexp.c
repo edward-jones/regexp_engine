@@ -4,6 +4,16 @@
 #include <stdio.h>
 #include <string.h>
 
+
+#define REX_ERR_PRINT(...) fprintf(stderr, __VA_ARGS__)
+#ifndef NDEBUG
+# define REX_DEBUG(exp) exp
+# define REX_DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
+#else
+# define REX_DEBUG(exp)
+# define REX_DEBUG_PRINT(...)
+#endif
+
 typedef enum {
   kEmptySet,
   kEpsilon,
@@ -23,7 +33,7 @@ enum {
 typedef struct {
   unsigned short type    : 15;
   unsigned short gc_mark : 1;
-  uint_least16_t n_subexp;
+  unsigned short n_subexp;
   uint_least16_t subexp[];
 } Exp;
 
@@ -31,8 +41,8 @@ typedef struct {
   struct {
     Exp *base;
     size_t size;
-    uint_least16_t next_offset;
-  } buffer;
+    unsigned short next_offset;
+  } heap;
 
   struct {
     size_t size;
@@ -56,7 +66,7 @@ static int is_unary(ExpType type) { return type == kKleene; }
 
 static Exp *get_exp(ExpContext *ctx, unsigned i) {
   assert(!is_interned(i));
-  return &ctx->buffer.base[exp_id_to_offset(i)];
+  return &ctx->heap.base[exp_id_to_offset(i)];
 }
 
 static ExpType get_exp_type(ExpContext *ctx, unsigned i) {
@@ -84,11 +94,11 @@ static unsigned alloc_exp(ExpContext *ctx, ExpType type, unsigned n_subexp) {
   assert(!is_unary(type) || (n_subexp == 1));
   assert(n_subexp > 0);
 
-  unsigned offset = ctx->buffer.next_offset;
+  unsigned offset = ctx->heap.next_offset;
   unsigned next_offset = next_exp_offset(offset, n_subexp);
-  assert(next_offset < ctx->buffer.size);
+  assert(next_offset < ctx->heap.size);
 
-  ctx->buffer.next_offset = next_offset;
+  ctx->heap.next_offset = next_offset;
   unsigned exp_id = offset_to_exp_id(offset);
   Exp *exp = get_exp(ctx, exp_id);
   exp->type = type;
@@ -128,6 +138,49 @@ static unsigned copy_exp(ExpContext *ctx, unsigned exp_id) {
   for (unsigned i = 0; i < exp->n_subexp; i++)
     res->subexp[i] = copy_exp(ctx, exp->subexp[i]);
   return res_id;
+}
+
+static void dump_exp_id(ExpContext *ctx, unsigned exp_id) {
+  switch (get_exp_type(ctx, exp_id)) {
+  default:
+    assert(0 && "Unknown expression type");
+  case kEmptySet:
+    REX_ERR_PRINT("{ }");
+    break;
+  case kEpsilon:
+    REX_ERR_PRINT("<e>");
+    break;
+  case kLiteral:
+    if (isprint(exp_id))
+      REX_ERR_PRINT("'%c'", exp_id);
+    else
+      REX_ERR_PRINT("0x%x", exp_id);
+    break;
+  case kUnion:
+    REX_ERR_PRINT("union");
+    break;
+  case kConcat:
+    REX_ERR_PRINT("concat");
+    break;
+  case kKleene:
+    REX_ERR_PRINT("kleene");
+    break;
+  }
+}
+
+static void dump_exp(ExpContext *ctx, unsigned exp_id, int indent) {
+  for (int i = 0; i < indent; i++)
+    REX_ERR_PRINT(". ");
+
+  dump_exp_id(ctx, exp_id);
+  REX_ERR_PRINT("\n");
+
+  if (is_interned(exp_id))
+    return;
+
+  Exp *exp = get_exp(ctx, exp_id);
+  for (unsigned i = 0; i < exp->n_subexp; i++)
+    dump_exp(ctx, exp->subexp[i], indent + 1);
 }
 
 //===------------------------- Garbage Collection -------------------------===//
@@ -184,7 +237,6 @@ static unsigned exp_id_adjust_map_find(ExpIDAdjustMap *map, unsigned exp_id) {
 static void exp_id_adjust_map_insert(ExpIDAdjustMap *map, unsigned start_id,
                                      unsigned end_id, unsigned adjust) {
   unsigned insert_pos = exp_id_adjust_map_find(map, start_id);
-  fprintf (stderr, "insert: %d %d %d at: %d\n", start_id, end_id, adjust, insert_pos);
   if (insert_pos < map->n_entries)
     assert (map->data[insert_pos].start_id != start_id);
 
@@ -199,11 +251,6 @@ static void exp_id_adjust_map_insert(ExpIDAdjustMap *map, unsigned start_id,
   entry->start_id = start_id;
   entry->end_id = end_id;
   entry->adjust = adjust;
-
-  for (int i = 0; i < map->n_entries; i++)
-    fprintf(stderr, "%d ", map->data[i].start_id);
-  fprintf(stderr, "\n");
-
 }
 
 static void gc_mark(ExpContext *ctx, unsigned exp_id, int mark) {
@@ -221,18 +268,17 @@ static unsigned gc_compute_exp_id_adjustments(ExpContext *ctx,
                                               unsigned *offset,
                                               unsigned *adjust) {
   int done = 1;
-
   clear_exp_id_adjust_map(map);
 
   // Add mappings until we run out of space or we're reached the end of the heap
   while (map->n_entries < map->n_alloc
-         && *offset < ctx->buffer.next_offset) {
+         && *offset < ctx->heap.next_offset) {
 
     // Iterate until we find an expression with the gc mark set, this is
     // the first id in the range to be adjusted
     int gc_mark = 0;
     unsigned next_offset = 0;
-    while (!gc_mark && *offset < ctx->buffer.next_offset) {
+    while (!gc_mark && *offset < ctx->heap.next_offset) {
       Exp *exp = get_exp(ctx, offset_to_exp_id(*offset));
       next_offset = next_exp_offset(*offset, exp->n_subexp);
       if (!exp->gc_mark) {
@@ -246,14 +292,12 @@ static unsigned gc_compute_exp_id_adjustments(ExpContext *ctx,
     assert (next_offset >= *offset);
     unsigned start_id = offset_to_exp_id(*offset);
 
-    dump_exp(ctx, start_id, 2);
-
     // Now keep iterating until the next expression doesn't have the gc mark
     // set. This will be the end of the range.
     *offset = next_offset;
     unsigned end_id = offset_to_exp_id(*offset);
 
-    while (gc_mark && *offset < ctx->buffer.next_offset) {
+    while (gc_mark && *offset < ctx->heap.next_offset) {
       unsigned exp_id = offset_to_exp_id(*offset);
       Exp *exp = get_exp(ctx, exp_id);
       *offset = next_exp_offset(*offset, exp->n_subexp);
@@ -261,6 +305,9 @@ static unsigned gc_compute_exp_id_adjustments(ExpContext *ctx,
       if (!exp->gc_mark)
         gc_mark = 0;
     }
+
+    REX_DEBUG_PRINT("  Start: %5d, End: %5d, Adjustment: %5d\n",
+                    start_id, end_id, -*adjust);
 
     // Add the entry to the map
     done = 0;
@@ -274,8 +321,6 @@ static unsigned gc_rewrite_exp_ids(ExpContext *ctx, ExpIDAdjustMap *map,
                                    unsigned exp_id) {
   if (is_interned(exp_id))
     return exp_id;
-
-  fprintf (stderr, "Rewriting %d\n", exp_id);
 
   // Recursively rewrite subexpressions
   Exp *exp = get_exp(ctx, exp_id);
@@ -293,17 +338,21 @@ static unsigned gc_rewrite_exp_ids(ExpContext *ctx, ExpIDAdjustMap *map,
   assert (exp_id >= entry->start_id);
   assert (exp_id < entry->end_id);
 
-  fprintf (stderr, "Adjusting exp_id %d %d\n", exp_id, exp_id - entry->adjust);
+  REX_DEBUG_PRINT("  %d -> %d\n", exp_id, exp_id - entry->adjust);
   return exp_id - entry->adjust;
 }
 
 static void gc_compact(ExpContext *ctx, ExpIDAdjustMap *map) {
   for (unsigned i = 0; i < map->n_entries; i++) {
     ExpIDAdjustEntry *entry = &map->data[i];
-    Exp *start = &ctx->buffer.base[exp_id_to_offset(entry->start_id)];
-    Exp *end   = &ctx->buffer.base[exp_id_to_offset(entry->end_id)];
+    Exp *start = &ctx->heap.base[exp_id_to_offset(entry->start_id)];
+    Exp *end   = &ctx->heap.base[exp_id_to_offset(entry->end_id)];
     Exp *dst   = start - entry->adjust;
-    memmove(dst, start, (end - start) * sizeof(Exp));
+    size_t size = (end - start) * sizeof(Exp);
+    memmove(dst, start, size);
+
+    REX_DEBUG_PRINT("  Copying %zu bytes from %d to %d\n",
+                    size, entry->start_id, entry->start_id - entry->adjust);
   }
 }
 
@@ -324,28 +373,37 @@ static unsigned gc_calculate_next_offset(ExpContext *ctx, unsigned exp_id) {
   return max_offset;
 }
 
-static void dump_buffers(ExpContext *ctx) {
+static void dump_heap(ExpContext *ctx) {
   unsigned offset = 0;
-  while (offset < ctx->buffer.next_offset) {
-    Exp *exp = get_exp(ctx, offset_to_exp_id(offset));
+  while (offset < ctx->heap.next_offset) {
+    unsigned exp_id = offset_to_exp_id(offset);
+    Exp *exp = get_exp(ctx, exp_id);
 
-    fprintf (stderr, "%d -> ", offset_to_exp_id(offset));
-    fprintf (stderr, exp->gc_mark ? "O" : "X");
-    fprintf (stderr, " [0x%x:", exp->type);
-    for (unsigned i = 0; i < exp->n_subexp; i++)
-      fprintf (stderr, " %d", exp->subexp[i]);
-    fprintf (stderr, "]\n");
+    fprintf (stderr, exp->gc_mark ? "      " : "<dead>");
+    fprintf (stderr, " (%d) ", exp_id);
 
-    offset = next_exp_offset(offset, exp->n_subexp);
+    fprintf (stderr, " [");
+    dump_exp_id(ctx, exp_id);
+    for (unsigned i = 0; i < exp->n_subexp; i++) {
+      fprintf (stderr, " ");
+      if (is_interned(exp->subexp[i]))
+        dump_exp_id(ctx, exp->subexp[i]);
+      else
+        REX_ERR_PRINT("%d", exp->subexp[i]);
+    }
+    REX_ERR_PRINT("]\n");
+    offset = next_exp_offset (offset, exp->n_subexp);
   }
-  fprintf (stderr, "\n\n");
 }
 
 static void garbage_collect(ExpContext *ctx) {
+  REX_DEBUG_PRINT("\nGarbage collect\n"
+                    "^^^^^^^^^^^^^^^\n\n");
+
   // Mark expressions reachable from the root
   gc_mark(ctx, ctx->exp_tree.root_id, /*mark=*/1);
 
-  dump_buffers(ctx);
+  REX_DEBUG(dump_heap(ctx));
 
   // Iteratively compact the heap. This could be done in a single pass but
   // then the size of the ExpID adjustment map could only be determined at
@@ -356,25 +414,43 @@ static void garbage_collect(ExpContext *ctx) {
 
   unsigned offset = 0;
   unsigned adjust = 0;
-  while (gc_compute_exp_id_adjustments(ctx, &exp_id_adjust_map,
-                                       &offset, &adjust)) {
+  unsigned iterations = 0;
+  while (1) {
+    // Compute a set of adjustments to the heap
+    REX_DEBUG_PRINT("\n~~ Computing heap offset adjustments\n");
+    int res = gc_compute_exp_id_adjustments(ctx, &exp_id_adjust_map, &offset,
+                                            &adjust);
+    if (!res)
+      break;
+
+    iterations++;
+
     // Offset adjustments have been computed, walk through the expression
     // tree from the root and rewrite expressions
+    REX_DEBUG_PRINT("\n~~ Rewriting expression ids\n");
     ctx->exp_tree.root_id = gc_rewrite_exp_ids(ctx, &exp_id_adjust_map,
                                                ctx->exp_tree.root_id);
 
     // Finally we can compact the expression tree based on the offset
     // adjustments
+    REX_DEBUG_PRINT("\n~~ Compacting heap\n");
     gc_compact(ctx, &exp_id_adjust_map);
   }
-  ctx->buffer.next_offset = gc_calculate_next_offset(ctx,
-                                                     ctx->exp_tree.root_id);
-  dump_buffers(ctx);
+  if (iterations == 0) {
+    REX_DEBUG_PRINT("\n");
+    return;
+  }
+
+  // If the heap was compacted, then compute the new top of the heap
+  ctx->heap.next_offset = gc_calculate_next_offset(ctx, ctx->exp_tree.root_id);
+
+  REX_DEBUG_PRINT("\n");
+  REX_DEBUG(dump_heap(ctx));
+  REX_DEBUG_PRINT("\n");
 
   // Clear the gc mark now we're done
   gc_mark(ctx, ctx->exp_tree.root_id, /*mark=*/0);
 }
-
 
 static int compare(ExpContext *ctx, unsigned lhs_id, unsigned rhs_id) {
   // First try and sort by type
@@ -695,58 +771,16 @@ static int simplify(ExpContext *ctx) {
   return modified;
 }
 
-static void dump_exp(ExpContext *ctx, unsigned exp_id, int indent) {
-  for (int i = 0; i < indent; i++)
-    fprintf(stderr, ". ");
-
-  switch (get_exp_type(ctx, exp_id)) {
-  default:
-    assert(0 && "Unknown expression type");
-  case kEmptySet:
-    fprintf(stderr, "{ }\n");
-    break;
-  case kEpsilon:
-    fprintf(stderr, "<e>\n");
-    break;
-  case kLiteral:
-    if (isprint(exp_id))
-      fprintf(stderr, "'%c'\n", exp_id);
-    else
-      fprintf(stderr, "0x%x\n", exp_id);
-    break;
-  case kUnion: {
-    Exp *exp = get_exp(ctx, exp_id);
-    fprintf(stderr, "union\n");
-    for (unsigned j = 0; j < exp->n_subexp; j++)
-      dump_exp(ctx, exp->subexp[j], indent + 1);
-    break;
-  }
-  case kConcat: {
-    Exp *exp = get_exp(ctx, exp_id);
-    fprintf(stderr, "concat\n");
-    for (unsigned j = 0; j < exp->n_subexp; j++)
-      dump_exp(ctx, exp->subexp[j], indent + 1);
-    break;
-  }
-  case kKleene: {
-    Exp *exp = get_exp(ctx, exp_id);
-    fprintf(stderr, "kleene\n");
-    dump_exp(ctx, exp->subexp[0], indent + 1);
-    break;
-  }
-  }
-}
-
 int match_regexp(ExpContext *ctx, const char *str, size_t strlen) {
   for (size_t i = 0; i < strlen; i++) {
 #ifndef NDEBUG
     dump_exp(ctx, ctx->exp_tree.root_id, 0);
-    fputc('\n', stderr);
+    REX_ERR_PRINT("\n");
 
-    fprintf(stderr, "%s\n", str);
+    REX_ERR_PRINT("%s\n", str);
     for (size_t j = 0; j < i; j++)
-      fputc(' ', stderr);
-    fprintf(stderr, "^\n\n");
+      REX_ERR_PRINT(" ");
+    REX_ERR_PRINT("^\n\n");
 #endif
 
     // Derive against the next character
@@ -757,6 +791,7 @@ int match_regexp(ExpContext *ctx, const char *str, size_t strlen) {
     flatten(ctx);
     garbage_collect(ctx);
 
+    // Repeatedly simplify the expression tree
     int modified = 1;
     while (modified) {
       modified = simplify(ctx);
@@ -764,27 +799,22 @@ int match_regexp(ExpContext *ctx, const char *str, size_t strlen) {
     }
 
     if (is_nullable(ctx, ctx->exp_tree.root_id)) {
-#ifndef NDEBUG
-      fprintf(stderr, "Found match!\n");
-#endif
+      REX_DEBUG_PRINT("Found match!\n");
       return 1;
     }
   }
-
-#ifndef NDEBUG
-  fprintf(stderr, "No match!\n");
-#endif
+  REX_DEBUG_PRINT("No match!\n");
   return 0;
 }
 
 int main(void) {
-  static Exp exp_buffer[8192];
+  static Exp exp_heap[8192];
 
   ExpContext ctx;
 
-  ctx.buffer.base = exp_buffer;
-  ctx.buffer.size = 8192;
-  ctx.buffer.next_offset = 0;
+  ctx.heap.base = exp_heap;
+  ctx.heap.size = 8192;
+  ctx.heap.next_offset = 0;
 
 #if 0
   ctx.exp_tree.root_id =
