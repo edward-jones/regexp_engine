@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <string.h>
 
-
 #define REX_ERR_PRINT(...) fprintf(stderr, __VA_ARGS__)
 #ifndef NDEBUG
 # define REX_DEBUG(exp) exp
@@ -21,7 +20,7 @@ typedef enum {
   kUnion,
   kConcat,
   kKleene,
-  kTombstone,
+  kInvalid,
 } ExpType;
 
 enum {
@@ -211,28 +210,23 @@ static void clear_exp_id_adjust_map(ExpIDAdjustMap *map) {
 }
 
 static unsigned exp_id_adjust_map_find(ExpIDAdjustMap *map, unsigned exp_id) {
-  for (unsigned i = 0; i < map->n_entries; i++)
-    if (exp_id < map->data[i].start_id)
-      return i;
-  return map->n_entries;
-
   if (map->n_entries == 0)
     return 0;
 
   unsigned low = 0;
-  unsigned high = map->n_entries - 1;
+  unsigned high = map->n_entries;
 
-  while (low <= high) {
+  while (low < high) {
     unsigned mid = (low + high) / 2;
-    unsigned start_id = map->data[mid].start_id;
-    if (exp_id > start_id)
+    unsigned mid_id = map->data[mid].start_id;
+    if (exp_id > mid_id)
       low = mid + 1;
-    else if (exp_id < start_id)
-      high = mid + 1;
+    else if (exp_id < mid_id)
+      high = mid - 1;
     else
       return mid;
   }
-  return high;
+  return low;
 }
 
 static void exp_id_adjust_map_insert(ExpIDAdjustMap *map, unsigned start_id,
@@ -301,13 +295,15 @@ static unsigned gc_compute_exp_id_adjustments(ExpContext *ctx,
     while (gc_mark && *offset < ctx->heap.next_offset) {
       unsigned exp_id = offset_to_exp_id(*offset);
       Exp *exp = get_exp(ctx, exp_id);
+      if (!exp->gc_mark) {
+        gc_mark = 0;
+        break;
+      }
       *offset = next_exp_offset(*offset, exp->n_subexp);
       end_id = offset_to_exp_id(*offset);
-      if (!exp->gc_mark)
-        gc_mark = 0;
     }
 
-    REX_DEBUG_PRINT("  Start: %5d, End: %5d, Adjustment: %5d\n",
+    REX_DEBUG_PRINT("  [Start: %d, End: %d, Adjust: %d]\n",
                     start_id, end_id, -*adjust);
 
     // Add the entry to the map
@@ -315,8 +311,13 @@ static unsigned gc_compute_exp_id_adjustments(ExpContext *ctx,
     exp_id_adjust_map_insert(map, start_id, end_id, *adjust);
   }
 
+#ifndef NDEBUG
+  for (size_t i = 0; i < map->n_entries; i++)
+    REX_ERR_PRINT("  [%d, %d, %d]\n", map->data[i].start_id,
+                  map->data[i].end_id, map->data[i].adjust);
   if (done)
-    REX_DEBUG_PRINT("... No adjustments to make\n");
+    REX_ERR_PRINT("... No adjustments to make\n");
+#endif
 
   return !done;
 }
@@ -331,16 +332,27 @@ static unsigned gc_rewrite_exp_ids(ExpContext *ctx, ExpIDAdjustMap *map,
   for (unsigned i = 0; i < exp->n_subexp; i++)
     exp->subexp[i] = gc_rewrite_exp_ids(ctx, map, exp->subexp[i]);
 
-  // Get the entry in the adjustment map which covers this expression id.
+  // Get the entry in the adjustment map which covers this expression id
+  //
+  // The map is sorted by the start of the range covered by the entry. If
+  // the find operation doesn't return an exact match then the adjustment
+  // to be applied for a given expression id will actually be found in the
+  // *previous* entry in the map.
+  //
+  // Below we determine the appropriate entry, with particular care around
+  // the boundary conditions.
   unsigned index = exp_id_adjust_map_find(map, exp_id);
-  if (index > 0)
-    index--;
-  ExpIDAdjustEntry *entry = map->data + index;
 
-  if (entry->start_id > exp_id || entry->end_id <= exp_id)
+  ExpIDAdjustEntry *entry;
+  if (index >= map->n_entries)
+    entry = map->data + index - 1;
+  else {
+    entry = map->data + index;
+    if (entry->start_id != exp_id && index > 0)
+      entry = map->data + index - 1;
+  }
+  if (entry->start_id > exp_id || exp_id >= entry->end_id)
     return exp_id;
-  assert (exp_id >= entry->start_id);
-  assert (exp_id < entry->end_id);
 
   REX_DEBUG_PRINT("  %d -> %d\n", exp_id, exp_id - entry->adjust);
   return exp_id - entry->adjust;
@@ -365,7 +377,7 @@ static void gc_compact(ExpContext *ctx, ExpIDAdjustMap *map) {
     for (unsigned i = 0; i < clear_size; i++) {
       unsigned offset = exp_id_to_offset(clear_start_id + i);
       Exp *exp = &ctx->heap.base[offset];
-      exp->type = kTombstone;
+      exp->type = kInvalid;
       exp->n_subexp = 0;
     }
 #endif
@@ -850,47 +862,6 @@ int main(void) {
   ctx.heap.next_offset = 0;
 
 #if 0
-  ctx.exp_tree.root_id =
-    new_kleene_star(&ctx,
-      new_kleene_star(&ctx,
-        new_kleene_star(&ctx,
-          new_concat(&ctx,
-            'a',
-            new_concat(&ctx,
-              'b',
-              new_concat(&ctx,
-                'c',
-                new_union(&ctx,
-                  new_union(&ctx, '1',
-                    new_union(&ctx, '2',
-                      new_concat(&ctx, 'd',
-                        new_concat(&ctx, 'e',
-                          new_concat(&ctx, 'f',
-                            new_union(&ctx, '3', '4')))))),
-                  '5')))))));
-
-  dump_exp(&ctx, ctx.exp_tree.root_id, 0);
-
-
-  Exp *root = get_exp(&ctx, ctx.exp_tree.root_id);
-  unsigned n_subexp = flatten_exp(&ctx, root->type, ctx.exp_tree.root_id, NULL);
-  unsigned new_root_id = alloc_exp(&ctx, root->type, n_subexp);
-  Exp *new_root = get_exp(&ctx, new_root_id);
-  flatten_exp(&ctx, root->type, ctx.exp_tree.root_id, new_root->subexp);
-
-  dump_exp(&ctx, new_root_id, 0);
-#endif
-
-  /*ctx.exp_tree.root_id =
-    new_concat(&ctx,
-      'a',
-      new_concat(&ctx,
-        'b',
-        'c'));
-  */
-
-
-/*
   ExpIDAdjustMap map;
   ExpIDAdjustEntry data[32];
   init_exp_id_adjust_map(&map, &data[0], 32);
@@ -902,11 +873,46 @@ int main(void) {
   exp_id_adjust_map_insert(&map, 251, 0, 0);
   exp_id_adjust_map_insert(&map, 250, 0, 0);
   return 0;
-*/
+#endif
 
+#if 0
+  unsigned concat_id = alloc_exp(&ctx, kConcat, 6);
+  Exp *c = get_exp(&ctx, concat_id);
+  c->subexp[0] = 'a';
+  c->subexp[1] = 'b';
+  c->subexp[2] = 'c';
+  c->subexp[3] = 'd';
+  c->subexp[4] = 'e';
+  c->subexp[5] = '5';
 
-  alloc_exp(&ctx, kConcat, 10);
+  alloc_exp(&ctx, kUnion, 3);
+  alloc_exp(&ctx, kUnion, 3);
 
+  unsigned union_id = alloc_exp(&ctx, kUnion, 5);
+  Exp *u = get_exp(&ctx, union_id);
+
+  u->subexp[0] = copy_exp(&ctx, concat_id);
+
+  alloc_exp(&ctx, kKleene, 1);
+  alloc_exp(&ctx, kUnion, 1);
+
+  u->subexp[1] = copy_exp(&ctx, concat_id);
+  u->subexp[2] = copy_exp(&ctx, concat_id);
+
+  copy_exp(&ctx, concat_id);
+
+  u->subexp[3] = copy_exp(&ctx, concat_id);
+  u->subexp[4] = copy_exp(&ctx, concat_id);
+  
+  alloc_exp(&ctx, kUnion, 1);
+
+  ctx.exp_tree.root_id = union_id;
+
+  garbage_collect(&ctx);
+#endif
+  
+
+#if 1
   ctx.exp_tree.root_id = alloc_exp(&ctx, kConcat, 5);
   Exp *root = get_exp(&ctx, ctx.exp_tree.root_id);
   root->subexp[0] = 'a';
@@ -923,6 +929,7 @@ int main(void) {
   dump_exp(&ctx, ctx.exp_tree.root_id, 0);
 
   match_regexp(&ctx, "abcde", 5);
+#endif
 
   return 0;
 }
