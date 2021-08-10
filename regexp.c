@@ -21,6 +21,7 @@ typedef enum {
   kUnion,
   kConcat,
   kKleene,
+  kTombstone,
 } ExpType;
 
 enum {
@@ -314,6 +315,9 @@ static unsigned gc_compute_exp_id_adjustments(ExpContext *ctx,
     exp_id_adjust_map_insert(map, start_id, end_id, *adjust);
   }
 
+  if (done)
+    REX_DEBUG_PRINT("... No adjustments to make\n");
+
   return !done;
 }
 
@@ -351,8 +355,20 @@ static void gc_compact(ExpContext *ctx, ExpIDAdjustMap *map) {
     size_t size = (end - start) * sizeof(Exp);
     memmove(dst, start, size);
 
-    REX_DEBUG_PRINT("  Copying %zu bytes from %d to %d\n",
+    REX_DEBUG_PRINT("   (Copy) %zu bytes from expression id %d to %d\n",
                     size, entry->start_id, entry->start_id - entry->adjust);
+#ifndef NDEBUG
+    unsigned clear_start_id = entry->end_id - entry->adjust;
+    size_t clear_size = entry->adjust * sizeof(Exp);
+    REX_DEBUG_PRINT("  (Clear) %zu bytes from expression id %d to %d\n",
+                    clear_size, clear_start_id, entry->end_id);
+    for (unsigned i = 0; i < clear_size; i++) {
+      unsigned offset = exp_id_to_offset(clear_start_id + i);
+      Exp *exp = &ctx->heap.base[offset];
+      exp->type = kTombstone;
+      exp->n_subexp = 0;
+    }
+#endif
   }
 }
 
@@ -397,8 +413,7 @@ static void dump_heap(ExpContext *ctx) {
 }
 
 static void garbage_collect(ExpContext *ctx) {
-  REX_DEBUG_PRINT("\nGarbage collect\n"
-                    "^^^^^^^^^^^^^^^\n\n");
+  REX_DEBUG_PRINT("##== Garbage collect ==##\n\n");
 
   // Mark expressions reachable from the root
   gc_mark(ctx, ctx->exp_tree.root_id, /*mark=*/1);
@@ -417,7 +432,7 @@ static void garbage_collect(ExpContext *ctx) {
   unsigned iterations = 0;
   while (1) {
     // Compute a set of adjustments to the heap
-    REX_DEBUG_PRINT("\n~~ Computing heap offset adjustments\n");
+    REX_DEBUG_PRINT("\n~> Computing expression id adjustments\n");
     int res = gc_compute_exp_id_adjustments(ctx, &exp_id_adjust_map, &offset,
                                             &adjust);
     if (!res)
@@ -427,13 +442,13 @@ static void garbage_collect(ExpContext *ctx) {
 
     // Offset adjustments have been computed, walk through the expression
     // tree from the root and rewrite expressions
-    REX_DEBUG_PRINT("\n~~ Rewriting expression ids\n");
+    REX_DEBUG_PRINT("\n~> Rewriting expression ids\n");
     ctx->exp_tree.root_id = gc_rewrite_exp_ids(ctx, &exp_id_adjust_map,
                                                ctx->exp_tree.root_id);
 
     // Finally we can compact the expression tree based on the offset
     // adjustments
-    REX_DEBUG_PRINT("\n~~ Compacting heap\n");
+    REX_DEBUG_PRINT("\n~> Compacting heap\n");
     gc_compact(ctx, &exp_id_adjust_map);
   }
   if (iterations == 0) {
@@ -444,7 +459,7 @@ static void garbage_collect(ExpContext *ctx) {
   // If the heap was compacted, then compute the new top of the heap
   ctx->heap.next_offset = gc_calculate_next_offset(ctx, ctx->exp_tree.root_id);
 
-  REX_DEBUG_PRINT("\n");
+  REX_DEBUG_PRINT("\n~> Final heap\n\n");
   REX_DEBUG(dump_heap(ctx));
   REX_DEBUG_PRINT("\n");
 
@@ -642,8 +657,26 @@ static unsigned derive_exp(ExpContext *ctx, unsigned exp_id, unsigned char c) {
 }
 
 static void derive(ExpContext *ctx, unsigned char c) {
+  REX_DEBUG_PRINT("##== Deriving ==##\n\n");
+
+#ifndef NDEBUG
+  REX_ERR_PRINT("~> Input character: ");
+  if (isprint(c))
+    REX_ERR_PRINT("'%c'\n", c);
+  else
+    REX_ERR_PRINT("0x%x\n", c);
+
+  REX_ERR_PRINT("~> Initial expression tree:\n\n");
+  dump_exp(ctx, ctx->exp_tree.root_id, 0);
+#endif
+
   unsigned new_root_id = derive_exp(ctx, ctx->exp_tree.root_id, c);
   ctx->exp_tree.root_id = new_root_id;
+
+#ifndef NDEBUG
+  REX_ERR_PRINT("\n~> Derived expression tree:\n\n");
+  dump_exp(ctx, ctx->exp_tree.root_id, 0);
+#endif
 }
 
 static unsigned flatten_exp(ExpContext *ctx, ExpType type, unsigned exp_id,
