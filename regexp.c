@@ -110,11 +110,11 @@ static unsigned alloc_exp(ExpContext *ctx, ExpType type, unsigned n_subexp) {
 static unsigned new_exp_n(ExpContext *ctx, ExpType type, unsigned n_subexp,
                           unsigned *subexp) {
   assert(subexp != NULL);
-  unsigned res_id = alloc_exp(ctx, type, n_subexp);
-  Exp *exp = get_exp(ctx, res_id);
+  unsigned exp_id = alloc_exp(ctx, type, n_subexp);
+  Exp *exp = get_exp(ctx, exp_id);
   for (unsigned i = 0; i < n_subexp; i++)
     exp->subexp[i] = subexp[i];
-  return res_id;
+  return exp_id;
 }
 
 static unsigned new_exp_1(ExpContext *ctx, ExpType type, unsigned subexp_id) {
@@ -124,7 +124,16 @@ static unsigned new_exp_1(ExpContext *ctx, ExpType type, unsigned subexp_id) {
 static unsigned new_exp_2(ExpContext *ctx, ExpType type, unsigned exp0,
                           unsigned exp1) {
   unsigned subexp[2] = {exp0, exp1};
-  return new_exp_n(ctx, type, 1, &subexp[0]);
+  return new_exp_n(ctx, type, 2, &subexp[0]);
+}
+
+static unsigned new_concat_from_string(ExpContext *ctx, const char *str,
+                                       unsigned len) {
+  unsigned exp_id = alloc_exp(ctx, kConcat, len);
+  Exp *exp = get_exp(ctx, exp_id);
+  for (unsigned i = 0; i < len; i++)
+    exp->subexp[i] = (uint_least16_t)str[i];
+  return exp_id;
 }
 
 static unsigned copy_exp(ExpContext *ctx, unsigned exp_id) {
@@ -566,21 +575,6 @@ static void merge_sort_exp(ExpContext *ctx, uint_least16_t *exp_list,
   }
 }
 
-static void sort_exp(ExpContext *ctx, unsigned exp_id) {
-  if (is_interned(exp_id))
-    return;
-
-  // Recursively sort subexpressions
-  Exp *exp = get_exp(ctx, exp_id);
-  for (unsigned i = 0; i < exp->n_subexp; i++)
-    sort_exp(ctx, exp->subexp[i]);
-
-  // Merge sort any union expression with more than two subexpressions
-  if (exp->type != kUnion || exp->n_subexp < 2)
-    return;
-  merge_sort_exp(ctx, &exp->subexp[0], exp->n_subexp, 2);
-}
-
 static int is_nullable(ExpContext *ctx, unsigned exp_id) {
   switch (get_exp_type(ctx, exp_id)) {
   default:
@@ -682,138 +676,154 @@ static void derive(ExpContext *ctx, unsigned char c) {
   dump_exp(ctx, ctx->exp_tree.root_id, 0);
 #endif
 
-  unsigned new_root_id = derive_exp(ctx, ctx->exp_tree.root_id, c);
-  ctx->exp_tree.root_id = new_root_id;
+  ctx->exp_tree.root_id = derive_exp(ctx, ctx->exp_tree.root_id, c);
 
 #ifndef NDEBUG
   REX_ERR_PRINT("\n~> Derived expression tree:\n\n");
   dump_exp(ctx, ctx->exp_tree.root_id, 0);
+  REX_ERR_PRINT("\n");
 #endif
 }
 
-static unsigned flatten_exp(ExpContext *ctx, ExpType type, unsigned exp_id,
-                            uint_least16_t *res_id) {
-  if (is_interned(exp_id)) {
-    if (res_id)
-      *res_id = exp_id;
-    return 1;
-  }
-
-  Exp *exp = get_exp(ctx, exp_id);
-  assert(exp->n_subexp > 0);
-
-  if (exp->type == type) {
-    unsigned n_res_added = 0;
-    for (unsigned i = 0; i < exp->n_subexp; i++) {
-      unsigned n = flatten_exp(ctx, type, exp->subexp[i], res_id);
-      if (res_id)
-        res_id += n;
-      n_res_added += n;
-    }
-    return n_res_added;
-  }
-
-  assert(exp->type != type);
-  if (res_id) {
-    unsigned res_n_subexp = flatten_exp(ctx, exp->type, exp_id, NULL);
-    *res_id = alloc_exp(ctx, exp->type, res_n_subexp);
-    Exp *res = get_exp(ctx, *res_id);
-    flatten_exp(ctx, exp->type, exp_id, &res->subexp[0]);
-  }
-  return 1;
-}
-
-static void flatten(ExpContext *ctx) {
-  uint_least16_t new_root_id;
-  flatten_exp(ctx, kEmptySet, ctx->exp_tree.root_id, &new_root_id);
-  ctx->exp_tree.root_id = new_root_id;
-}
-
-static unsigned simplify_exp(ExpContext *ctx, unsigned exp_id, int *modified) {
-  assert(modified);
+static unsigned simplify_exp(ExpContext *ctx, unsigned exp_id) {
+  // Interned expressions need no simplification
   if (is_interned(exp_id))
     return exp_id;
 
   Exp *exp = get_exp(ctx, exp_id);
+  assert (exp->n_subexp > 0);
 
-  if (is_binary(exp->type) && exp->n_subexp == 1) {
-    *modified = 1;
-    return simplify_exp(ctx, exp->subexp[0], modified);
-  }
-
-  if (exp->type == kUnion) {
-    unsigned n_non_empty_set = 0;
-    unsigned non_empty_set_subexp_id = 0;
+  // Simplify all of the subexpressions in turn
+  {
+    unsigned res_id = alloc_exp(ctx, exp->type, exp->n_subexp);
+    Exp *res = get_exp(ctx, res_id);
     for (unsigned i = 0; i < exp->n_subexp; i++)
-      if (exp->subexp[i] != kEmptySetID) {
-        non_empty_set_subexp_id = exp->subexp[i];
-        n_non_empty_set++;
+      res->subexp[i] = simplify_exp(ctx, exp->subexp[i]);
+    exp = res;
+    exp_id = res_id;
+  }
+
+  // Now perform simplifications on the expression
+
+  // If any of the subexpressions are of the same type as the expression, then
+  // create a new expression with the subexpressions flattened into it
+  // First count the total number of subexpressions
+  unsigned n_subexp = exp->n_subexp;
+  for (unsigned i = 0; i < exp->n_subexp; i++) {
+    if (get_exp_type(ctx, exp->subexp[i]) == exp->type) {
+      Exp *subexp = get_exp(ctx, exp->subexp[i]);
+      n_subexp += subexp->n_subexp - 1;
+    }
+  }
+  if (n_subexp != exp->n_subexp) {
+    // Flatten the subexpressions into a new result expressions
+    unsigned res_id = alloc_exp(ctx, exp->type, n_subexp);
+    Exp *res = get_exp(ctx, res_id);
+    for (unsigned i = 0, out_index = 0; i < exp->n_subexp; i++) {
+      if (get_exp_type(ctx, exp->subexp[i]) == exp->type) {
+        Exp *subexp = get_exp(ctx, exp->subexp[i]);
+        for (unsigned j = 0; j < subexp->n_subexp; j++)
+          res->subexp[out_index++] = subexp->subexp[j];
+      } else
+        res->subexp[out_index++] = exp->subexp[i];
+    }
+    exp = res;
+    exp_id = res_id;
+  }
+
+  // Union simplification
+  if (exp->type == kUnion) {
+    if (exp->n_subexp == 1)
+      return exp->subexp[0];
+
+    // First sort the union subexpressions in place
+    if (exp->n_subexp >= 2)
+      merge_sort_exp(ctx, &exp->subexp[0], exp->n_subexp, 2);
+
+    // Try and simplify by removing duplicates and empty set expressions.
+    // First just count how many subexpressions we'll end up with
+    unsigned n_subexp = 0;
+    for (unsigned i = 0; i < exp->n_subexp; i++) {
+      if (exp->subexp[i] == kEmptySetID)
+        continue;
+      if (i > 0 && !compare(ctx, exp->subexp[i-1], exp->subexp[i]))
+        continue;
+
+      n_subexp++;
+    }
+    if (n_subexp != exp->n_subexp) {
+      if (n_subexp == 0)
+        return kEmptySetID;
+
+      // Allocate a new expressions with empty set and duplicate expressions
+      // removed
+      unsigned res_id = alloc_exp(ctx, exp->type, n_subexp);
+      Exp *res = get_exp(ctx, res_id);
+      for (unsigned i = 0, out_index = 0; i < exp->n_subexp; i++) {
+        if (exp->subexp[i] == kEmptySetID)
+          continue;
+        if (i > 0 && !compare(ctx, exp->subexp[i-1], exp->subexp[i]))
+          continue;
+
+        res->subexp[out_index++] = exp->subexp[i];
       }
-
-    if (n_non_empty_set == 0) {
-      *modified = 1;
-      return kEmptySetID;
+      exp = res;
+      exp_id = res_id;
     }
 
-    if (n_non_empty_set == 1) {
-      *modified = 1;
-      return simplify_exp(ctx, non_empty_set_subexp_id, modified);
-    }
-
-    if (n_non_empty_set != exp->n_subexp) {
-      unsigned res_id = alloc_exp(ctx, kUnion, n_non_empty_set);
-      Exp *res = get_exp(ctx, res_id);
-      for (unsigned i = 0, j = 0; i < exp->n_subexp; i++)
-        if (exp->subexp[i] != kEmptySetID)
-          res->subexp[j++] = simplify_exp(ctx, exp->subexp[i], modified);
-
-      *modified = 1;
-      return res_id;
-    }
+    assert (exp->n_subexp > 0);
+    if (exp->n_subexp == 1)
+      return exp->subexp[0];
+    else
+      return exp_id;
   }
 
+  // Concat simplification
   if (exp->type == kConcat) {
-    unsigned n_non_empty_set = 0;
-    while (exp->subexp[n_non_empty_set] != kEmptySetID &&
-           n_non_empty_set < exp->n_subexp)
-      n_non_empty_set++;
+    if (n_subexp == 1)
+      return exp->subexp[0];
 
-    if (n_non_empty_set == 0) {
-      *modified = 1;
-      return kEmptySetID;
+    // Count the number of subexpressions before we encounter an empty set
+    unsigned n_subexp = 0;
+    while (exp->subexp[n_subexp] != kEmptySetID && n_subexp < exp->n_subexp)
+      n_subexp++;
+
+    if (n_subexp != exp->n_subexp) {
+      if (n_subexp == 0)
+        return kEmptySetID;
+
+      // if it wasn't the last subexpression which was the empty set, then
+      // allocate a new expression which stops after the empty set
+      if (n_subexp != exp->n_subexp - 1) {
+        n_subexp += 1;
+        unsigned res_id = alloc_exp(ctx, exp->type, n_subexp);
+        Exp *res = get_exp(ctx, res_id);
+        for (unsigned i = 0; i < n_subexp; i++)
+          res->subexp[i] = exp->subexp[i];
+        exp = res;
+        exp_id = res_id;
+      }
     }
-
-    if (n_non_empty_set == 1) {
-      *modified = 1;
-      return simplify_exp(ctx, exp->subexp[0], modified);
-    }
-
-    if (n_non_empty_set != exp->n_subexp) {
-      unsigned res_id = alloc_exp(ctx, kConcat, n_non_empty_set);
-      Exp *res = get_exp(ctx, res_id);
-      for (unsigned i = 0; i < res->n_subexp; i++)
-        res->subexp[i] = simplify_exp(ctx, exp->subexp[i], modified);
-
-      *modified = 1;
-      return res_id;
-    }
+    return exp_id;
   }
 
-  unsigned res_id = alloc_exp(ctx, exp->type, exp->n_subexp);
-  Exp *res = get_exp(ctx, res_id);
-  for (unsigned i = 0; i < exp->n_subexp; i++)
-    res->subexp[i] = simplify_exp(ctx, exp->subexp[i], modified);
-
-  return res_id;
+  return exp_id;
 }
 
-static int simplify(ExpContext *ctx) {
-  int modified = 0;
+static void simplify(ExpContext *ctx) {
+  REX_DEBUG_PRINT("##== Simplifying ==##\n\n");
+#ifndef NDEBUG
+  REX_ERR_PRINT("~> Original expression tree:\n\n");
+  dump_exp(ctx, ctx->exp_tree.root_id, 0);
+#endif
 
-  unsigned new_root_id = simplify_exp(ctx, ctx->exp_tree.root_id, &modified);
-  ctx->exp_tree.root_id = new_root_id;
+  ctx->exp_tree.root_id = simplify_exp(ctx, ctx->exp_tree.root_id);
 
-  return modified;
+#ifndef NDEBUG
+  REX_ERR_PRINT("\n~> Simplified expression tree:\n\n");
+  dump_exp(ctx, ctx->exp_tree.root_id, 0);
+  REX_ERR_PRINT("\n");
+#endif
 }
 
 int match_regexp(ExpContext *ctx, const char *str, size_t strlen) {
@@ -832,23 +842,22 @@ int match_regexp(ExpContext *ctx, const char *str, size_t strlen) {
     derive(ctx, str[i]);
     garbage_collect(ctx);
 
-    // Flatten the resultant expression tree
-    flatten(ctx);
+    // Simplify the expression tree
+    simplify(ctx);
     garbage_collect(ctx);
 
-    // Repeatedly simplify the expression tree
-    int modified = 1;
-    while (modified) {
-      modified = simplify(ctx);
-      garbage_collect(ctx);
+    // If we've collapsed to the empty set then there's no way we can match
+    if (ctx->exp_tree.root_id == kEmptySetID) {
+      REX_DEBUG_PRINT("~> Expression collapsed to the empty set, no match\n");
+      return 0;
     }
 
     if (is_nullable(ctx, ctx->exp_tree.root_id)) {
-      REX_DEBUG_PRINT("Found match!\n");
+      REX_DEBUG_PRINT("~> Expression is nullable, found match!\n");
       return 1;
     }
   }
-  REX_DEBUG_PRINT("No match!\n");
+  REX_DEBUG_PRINT("~> Reached end of string with no match\n");
   return 0;
 }
 
@@ -913,22 +922,15 @@ int main(void) {
   
 
 #if 1
-  ctx.exp_tree.root_id = alloc_exp(&ctx, kConcat, 5);
-  Exp *root = get_exp(&ctx, ctx.exp_tree.root_id);
-  root->subexp[0] = 'a';
-  root->subexp[1] = 'b';
-  root->subexp[2] = 'c';
-  root->subexp[3] = 'd';
-  root->subexp[4] = 'e';
 
-  alloc_exp(&ctx, kConcat, 10);
+  ctx.exp_tree.root_id =
+      new_exp_2(&ctx, kUnion,
+                new_concat_from_string(&ctx, "hello", 5),
+                new_concat_from_string(&ctx, "world", 5));
 
-  garbage_collect(&ctx);
-
-  sort_exp(&ctx, ctx.exp_tree.root_id);
   dump_exp(&ctx, ctx.exp_tree.root_id, 0);
 
-  match_regexp(&ctx, "abcde", 5);
+  match_regexp(&ctx, "world", 5);
 #endif
 
   return 0;
